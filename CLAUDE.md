@@ -176,6 +176,36 @@ Comprehensive research in `research/` — see `research/README.md` for full inde
 
 ---
 
+## Experiment Variants (March 25, 2026)
+
+Ready-to-run experiment code in `experiments/`. Use `bash experiments/run_sweep.sh` for the full menu.
+
+### Env-var-only experiments (use baseline script)
+| Experiment | Command | Expected Gain |
+|---|---|---|
+| v1: MTP 2 heads | `MTP_NUM_HEADS=2 MTP_LOSS_WEIGHT=0.2` | -0.003 to -0.005 |
+| v3: NTK eval 2816 | `EVAL_SEQ_LEN=2816` | -0.001 to -0.003 |
+| v5: MTP + BigramHash | `MTP_NUM_HEADS=2 MTP_LOSS_WEIGHT=0.2 BIGRAM_VOCAB_SIZE=4096` | -0.004 to -0.006 |
+| v7: NTK + Bigram + WD | `EVAL_SEQ_LEN=2816 BIGRAM_VOCAB_SIZE=4096 WARMDOWN_ITERS=4500` | -0.003 to -0.005 |
+
+### Code-change experiments (modified train_gpt.py)
+| Experiment | Script | Key Change |
+|---|---|---|
+| v2: Int5 MLP | `experiments/v2_int5_mlp/train_gpt.py` | int5 quant for MLP, int6 for attention |
+| v4: 12L + Int5 | `experiments/v4_12layers_int5/train_gpt.py` | 12 layers + int5 MLP |
+| v8: Kitchen Sink | Uses v4 script + env vars | All improvements stacked |
+| v9: LoRA TTT | `experiments/v9_lora_ttt/train_gpt.py` | Test-time LoRA adaptation |
+
+### Experiment Priorities (run in this order)
+1. **v1_mtp2** — free gain, zero risk
+2. **v3_ntk_2816** — free gain from longer eval context
+3. **v2_int5_mlp** — validate int5 quality
+4. **v5_mtp2_bigram4096** — stack free wins
+5. **v4_12layers_int5** — if int5 works, add 12th layer
+6. **v9_lora_ttt** — highest EV but most complex
+
+---
+
 ## Support
 
 OpenAI Discord: `#parameter-golf-discussions` and `#parameter-golf-announcements`
