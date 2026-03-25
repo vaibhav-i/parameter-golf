@@ -27,6 +27,12 @@ Deep-dive research into the OpenAI Parameter Golf challenge, produced March 24, 
 | [strategy.md](strategy.md) | Synthesis — technique rankings, integration opportunities, concrete next steps |
 | [meta-review-and-plan.md](meta-review-and-plan.md) | Meta-review of all research + phased execution plan + experiment templates + compute grant notes |
 
+### Literature Reviews
+| File | Description |
+|------|-------------|
+| [citation-graph-review.md](citation-graph-review.md) | Citation-graph research from modded-nanogpt + slowrun references via Semantic Scholar |
+| [advanced-literature-review.md](advanced-literature-review.md) | Keyword-based literature review across 10 topic areas |
+
 ### Implementation Guides
 | File | Description |
 |------|-------------|
