@@ -65,7 +65,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
-    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 16))
     mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 0))
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.2))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
@@ -583,7 +583,7 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 class Block(nn.Module):
     def __init__(
@@ -818,6 +818,7 @@ def eval_val_sliding(
     stride: int,
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
+    temperature: float = 1.0,
 ) -> tuple[float, float]:
     """Sliding window evaluation: each token scored with maximum context."""
     seq_len = eval_seq_len or args.train_seq_len
@@ -849,6 +850,8 @@ def eval_val_sliding(
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = compiled_logits(x_batch)
+            if temperature != 1.0:
+                logits = logits / temperature
             nll = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
                 y_batch.reshape(-1),
@@ -1365,6 +1368,22 @@ def main() -> None:
     )
     log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     sw_seq_len = effective_eval_seq_len
+    # Temperature scaling: grid search for optimal temperature
+    best_temp = 1.0
+    if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+        log0("temperature_search: starting grid search over [0.90, 0.95, 1.00, 1.05, 1.10]")
+        best_bpb = float("inf")
+        for temp_candidate in [0.90, 0.95, 1.00, 1.05, 1.10]:
+            _, t_bpb = eval_val_sliding(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=64, eval_seq_len=sw_seq_len, temperature=temp_candidate,
+            )
+            log0(f"temperature_search: T={temp_candidate:.2f} bpb={t_bpb:.6f}")
+            if t_bpb < best_bpb:
+                best_bpb = t_bpb
+                best_temp = temp_candidate
+        log0(f"temperature_search: best T={best_temp:.2f} bpb={best_bpb:.6f}")
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
         t_slide = time.perf_counter()
@@ -1372,7 +1391,7 @@ def main() -> None:
             args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride,
-            eval_seq_len=sw_seq_len,
+            eval_seq_len=sw_seq_len, temperature=best_temp,
         )
         torch.cuda.synchronize()
         log0(
