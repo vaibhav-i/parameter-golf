@@ -22,3 +22,24 @@ LOG_BIAS_ENABLED=0 SEED=1337 torchrun --standalone --nproc_per_node=8 train_gpt.
 LOG_BIAS_LR=0.0001   # slower adaptation
 LOG_BIAS_LR=0.01     # faster adaptation (may overshoot)
 LOG_BIAS_RESET=1     # reset b per window (weaker but safer)
+
+## Running with SP1024 (available now)
+
+SP8192 is not yet in the upstream manifest — only SP1024 is available. With SP1024
+results will be ~0.03–0.05 BPB worse than SP8192 frontier numbers. The log-bias
+vector b has shape R^vocab, so with VOCAB_SIZE=1024 it is 8x smaller — negligible
+artifact cost either way.
+
+```bash
+# With log-bias:
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+LOG_BIAS_ENABLED=1 LOG_BIAS_LR=0.001 SEED=1337 torchrun --standalone --nproc_per_node=8 train_gpt.py
+
+# Without log-bias (baseline):
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+LOG_BIAS_ENABLED=0 SEED=1337 torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
