@@ -1405,19 +1405,22 @@ def eval_val_sliding_causal_slot_with_log_bias(
         )
 
         # Optimize delta on context tokens only
-        for _ in range(slot_steps):
-            slot_opt.zero_grad()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                hidden = base_model.forward_hidden(x)
-                hidden_adapted = hidden + delta
-                logits_ctx = base_model.hidden_to_logits(hidden_adapted)
+        # Must exit inference_mode so autograd can track gradients through forward_hidden
+        with torch.inference_mode(mode=False):
+            with torch.enable_grad():
+                for _ in range(slot_steps):
+                    slot_opt.zero_grad()
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        hidden = base_model.forward_hidden(x.clone())
+                        hidden_adapted = hidden + delta
+                        logits_ctx = base_model.hidden_to_logits(hidden_adapted)
 
-            ctx_end = context_size
-            ctx_logits = logits_ctx[0, :ctx_end, :].float()
-            ctx_targets = y[:ctx_end]
-            ctx_loss = F.cross_entropy(ctx_logits, ctx_targets)
-            ctx_loss.backward()
-            slot_opt.step()
+                    ctx_end = context_size
+                    ctx_logits = logits_ctx[0, :ctx_end, :].float()
+                    ctx_targets = y[:ctx_end]
+                    ctx_loss = F.cross_entropy(ctx_logits, ctx_targets)
+                    ctx_loss.backward()
+                    slot_opt.step()
 
         # Get logits for entire window with frozen delta
         with torch.no_grad():
