@@ -81,7 +81,7 @@ class Hyperparameters():
     matrix_lr = float(os.environ.get('MATRIX_LR', 0.02))
     scalar_lr = float(os.environ.get('SCALAR_LR', 0.02))
     muon_momentum = float(os.environ.get('MUON_MOMENTUM', 0.99))
-    muon_backend_steps = int(os.environ.get('MUON_BACKEND_STEPS', 5))
+    muon_backend_steps = int(os.environ.get('MUON_BACKEND_STEPS', 4))  # 4 for Polar Express
     muon_momentum_warmup_start = float(os.environ.get('MUON_MOMENTUM_WARMUP_START', 0.92))
     muon_momentum_warmup_steps = int(os.environ.get('MUON_MOMENTUM_WARMUP_STEPS', 1500))
     muon_row_normalize = bool(int(os.environ.get('MUON_ROW_NORMALIZE', '1')))
@@ -104,7 +104,7 @@ class Hyperparameters():
     embed_bits = int(os.environ.get('EMBED_BITS', 8))
     matrix_clip_sigmas = float(os.environ.get('MATRIX_CLIP_SIGMAS', 12.85))
     embed_clip_sigmas = float(os.environ.get('EMBED_CLIP_SIGMAS', 20.0))
-    mr_gptq_enabled = bool(int(os.environ.get('MR_GPTQ_ENABLED', '1')))
+    muon_plus_enabled = bool(int(os.environ.get('MUON_PLUS', '1')))
 
     # Distributed setup
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -570,15 +570,23 @@ def classify_param(name: str) -> str:
 # Optimization
 # ----------------------------------------
 
+# Polar Express: minimax-optimal per-step coefficients (arXiv:2505.16932)
+_PE_COEFFS = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
+
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
         X = X.T
-    for _ in range(steps):
+    for a, b, c in _PE_COEFFS[:steps]:
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -588,12 +596,12 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int,
                  nesterov: bool = True, weight_decay: float = 0.0,
-                 row_normalize: bool = False):
+                 row_normalize: bool = False, muon_plus: bool = False):
         super().__init__(
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps,
                  nesterov=nesterov, weight_decay=weight_decay,
-                 row_normalize=row_normalize),
+                 row_normalize=row_normalize, muon_plus=muon_plus),
         )
 
     @torch.no_grad()
@@ -630,7 +638,10 @@ class Muon(torch.optim.Optimizer):
                         row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-07)
                         g = g / row_norms.to(g.dtype)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    if group.get("muon_plus", False):
+                        g = g * (g.numel() ** 0.5) / (g.norm() + 1e-7)
+                    else:
+                        g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
             if distributed:
@@ -692,6 +703,7 @@ class Optimizers():
             backend_steps=h.muon_backend_steps,
             weight_decay=h.muon_wd,
             row_normalize=h.muon_row_normalize,
+            muon_plus=h.muon_plus_enabled,
         )
         for group in self.optimizer_muon.param_groups:
             group["base_lr"] = h.matrix_lr
@@ -797,53 +809,6 @@ def collect_hessians(
     return hessians
 
 
-def _fwht(x: torch.Tensor) -> torch.Tensor:
-    """Fast Walsh-Hadamard Transform along the last dimension (in-place butterfly)."""
-    n = x.shape[-1]
-    h = 1
-    while h < n:
-        x = x.reshape(*x.shape[:-1], n // (2 * h), 2 * h)
-        x_even = x[..., :h]
-        x_odd = x[..., h:]
-        x = torch.cat([x_even + x_odd, x_even - x_odd], dim=-1)
-        x = x.reshape(*x.shape[:-2], n)
-        h *= 2
-    return x
-
-
-def hadamard_rotation(W: torch.Tensor, seed: int = 42) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply a randomized Hadamard rotation to weight matrix columns.
-
-    Rotates W by W @ diag(D) @ H / sqrt(n_pad), where D is a random ±1 diagonal
-    and H is the Walsh-Hadamard matrix. Spreads outliers uniformly across all
-    columns, reducing GPTQ quantization MSE (MR-GPTQ, PR #1400).
-
-    Returns:
-        W_rot: rotated weight matrix (same shape as W[:, :n])
-        D: the random sign vector used (needed to invert the rotation downstream)
-    """
-    n = W.shape[1]
-    # Pad to next power of 2 for the fast transform
-    n_pad = 1
-    while n_pad < n:
-        n_pad *= 2
-
-    torch.manual_seed(seed)
-    D = torch.randint(0, 2, (n_pad,), device=W.device).float() * 2 - 1  # ±1
-
-    if n < n_pad:
-        W_pad = torch.zeros(W.shape[0], n_pad, device=W.device, dtype=W.dtype)
-        W_pad[:, :n] = W
-    else:
-        W_pad = W.clone()
-
-    # W_rot = W_pad * D (scale columns) then Hadamard-transform rows
-    W_rot = W_pad * D.unsqueeze(0)
-    W_rot = _fwht(W_rot) / (n_pad ** 0.5)
-
-    return W_rot[:, :n], D  # return full D of length n_pad
-
-
 def gptq_quantize_weight(
     w: Tensor,
     H: Tensor,
@@ -910,21 +875,11 @@ def gptq_mixed_quantize(
             continue
         cs = h.embed_clip_sigmas if "tok_emb" in name else h.matrix_clip_sigmas
         bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
-        if h.mr_gptq_enabled and t.ndim == 2:
-            # MR-GPTQ: rotate weight columns with a randomized Hadamard before quantizing.
-            # This spreads outliers uniformly, dramatically reducing quantization MSE.
-            # D (full length n_pad) is stored so dequantize_mixed can invert the rotation.
-            t_rot, D = hadamard_rotation(t.float())
-            q, s = gptq_quantize_weight(
-                t_rot, hessians[name], clip_sigmas=cs, clip_range=2**(bits - 1) - 1)
-            meta[name] = f"mr-gptq (int{bits})"
-            result[name + ".D"] = D.to(torch.int8)   # store sign vector for inverse rotation
-        else:
-            q, s = gptq_quantize_weight(
-                t, hessians[name], clip_sigmas=cs, clip_range=2**(bits - 1) - 1)
-            meta[name] = f"gptq (int{bits})"
+        q, s = gptq_quantize_weight(
+            t, hessians[name], clip_sigmas=cs, clip_range=2**(bits - 1) - 1)
         result[name + ".q"] = q
         result[name + ".scale"] = s
+        meta[name] = f"gptq (int{bits})"
 
     categories = collections.defaultdict(set)
     for name, cat in meta.items():
@@ -953,22 +908,9 @@ def dequantize_mixed(result: dict[str, Tensor], meta: dict[str, object],
             continue
         q, s = result[name + ".q"], result[name + ".scale"]
         if s.ndim > 0:
-            W_deq = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1))))
+            out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
         else:
-            W_deq = (q.float() * float(s.item()))
-        if "mr-gptq" in info:
-            # Invert the Hadamard rotation applied before quantization.
-            # Rotation was: W_rot = FWHT(W_pad * D) / sqrt(n_pad)
-            # Inverse:       W_pad = FWHT(W_rot_pad) * D / sqrt(n_pad)
-            D = result[name + ".D"].float()   # ±1 sign vector, length n_pad
-            n_pad = D.shape[0]
-            n = orig.shape[1]
-            W_rot_pad = torch.zeros(W_deq.shape[0], n_pad, dtype=W_deq.dtype)
-            W_rot_pad[:, :n] = W_deq
-            W_unrot = _fwht(W_rot_pad) * D.unsqueeze(0) / (n_pad ** 0.5)
-            out[name] = W_unrot[:, :n].to(orig_dtype)
-        else:
-            out[name] = W_deq.to(orig_dtype)
+            out[name] = (q.float() * float(s.item())).to(orig_dtype)
     return out
 
 
