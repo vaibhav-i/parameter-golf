@@ -2,7 +2,7 @@
 
 A comprehensive reference for every major technique used in the OpenAI Parameter Golf challenge, written for a beginner-intermediate ML audience. Each entry explains what the technique is, why it matters in this specific competition, how it is implemented, what you trade off, and which leaderboard entries used it.
 
-**Competition context:** Train the best language model that fits in a 16MB artifact (code + compressed model) in under 10 minutes on 8xH100 GPUs. The metric is bits-per-byte (BPB) on the FineWeb validation set. Lower is better. The current SOTA is 1.1228 BPB.
+**Competition context:** Train the best language model that fits in a 16MB artifact (code + compressed model) in under 10 minutes on 8xH100 GPUs. The metric is bits-per-byte (BPB) on the FineWeb validation set. Lower is better. The current SOTA is **1.1147 BPB** (abaybektursun, 2026-03-25).
 
 ---
 
@@ -16,7 +16,9 @@ A comprehensive reference for every major technique used in the OpenAI Parameter
    - [QAT with STE (Quantization-Aware Training)](#qat-with-ste-quantization-aware-training)
    - [Late QAT vs Early QAT](#late-qat-vs-early-qat)
    - [GPTQ-lite (Clip Percentile Search)](#gptq-lite-clip-percentile-search)
-   - [Compression: zstd-22 vs zlib](#compression-zstd-22-vs-zlib)
+   - [Full Hessian GPTQ + AR Self-Gen Calibration](#full-hessian-gptq--ar-self-gen-calibration)
+   - [Selective ±1 Pruning](#selective-1-pruning)
+   - [Compression: zstd-22 vs zlib vs LZMA](#compression-zstd-22-vs-zlib-vs-lzma)
 2. [Weight Averaging](#weight-averaging)
    - [EMA (Exponential Moving Average)](#ema-exponential-moving-average)
    - [SWA (Stochastic Weight Averaging)](#swa-stochastic-weight-averaging)
@@ -36,6 +38,7 @@ A comprehensive reference for every major technique used in the OpenAI Parameter
 5. [Architecture](#architecture)
    - [U-Net Skip Connections](#u-net-skip-connections)
    - [MLP Expansion Ratio](#mlp-expansion-ratio)
+   - [LeakyReLU(0.5)^2 Activation](#leakyrelu052-activation)
    - [Layer Count Tradeoffs](#layer-count-tradeoffs)
    - [Overtone/Spectral Initialization](#overtonespectral-initialization)
    - [Orthogonal Initialization](#orthogonal-initialization)
@@ -43,6 +46,7 @@ A comprehensive reference for every major technique used in the OpenAI Parameter
    - [LayerNorm Scale Factors](#layernorm-scale-factors)
 6. [Optimizers](#optimizers)
    - [Muon Optimizer](#muon-optimizer)
+   - [Parallel Muon + Parameter Banking](#parallel-muon--parameter-banking)
    - [Muon Momentum Warmup](#muon-momentum-warmup)
    - [Muon Weight Decay](#muon-weight-decay)
    - [AdamW for Embeddings](#adamw-for-embeddings)
@@ -50,9 +54,14 @@ A comprehensive reference for every major technique used in the OpenAI Parameter
    - [Warmdown Timing Effects](#warmdown-timing-effects)
 7. [Evaluation Tricks](#evaluation-tricks)
    - [Sliding Window Evaluation](#sliding-window-evaluation)
+   - [Stride-16 vs Stride-64](#stride-16-vs-stride-64)
+   - [Temperature Scaling](#temperature-scaling)
    - [Sequence Length and Eval](#sequence-length-and-eval)
 8. [Test-Time Training](#test-time-training)
    - [LoRA TTT](#lora-ttt)
+   - [Full-Model SGD TTT (Score-First)](#full-model-sgd-ttt-score-first)
+9. [Confirmed Dead Ends](#confirmed-dead-ends)
+   - [Depth Recurrence](#depth-recurrence)
 
 ---
 
@@ -187,17 +196,60 @@ for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
 
 **Tradeoffs.** The search is deterministic and fast (5 candidates per row). It adds a few seconds to the export step. The improvement is modest (~0.0006 BPB) but free.
 
-**Who used it.** The current SOTA entry (1.1228/1.1233, signalrush) introduced GPTQ-lite, contributing -0.0006 BPB.
+**Who used it.** The signalrush entry (1.1228) introduced GPTQ-lite. Superseded by Full Hessian GPTQ in the current SOTA (1.1147).
 
-### Compression: zstd-22 vs zlib
+### Full Hessian GPTQ + AR Self-Gen Calibration
 
-**What it is.** After quantization, the weight tensors are serialized and compressed with a lossless compression algorithm. The two options explored are zlib (Python built-in, level 9) and zstandard (zstd, level 22 -- the maximum compression level).
+**What it is.** Full Hessian GPTQ is a strictly better quantizer than GPTQ-lite. Instead of just searching over clip percentiles (diagonal approximation), it uses the full Hessian matrix H = X^T X to understand weight correlations, then applies Cholesky error compensation with column reordering to minimize total reconstruction error.
 
-**Why it helps.** zstd-22 provides ~5% better compression than zlib-9 on int6 quantized data. For a model that is borderline on the 16MB limit, this savings (~0.5-1.5MB) can be the difference between fitting an extra transformer layer or not.
+The "AR self-gen" part solves the calibration data problem: previous Full GPTQ implementations used training data for calibration, which was ruled illegal after the 600s training window. The solution is to have the model autoregressively generate its own calibration data (64 sequences x 2048 tokens, temperature=0.8, fixed seed). No validation data and no training data are accessed during quantization.
 
-**Tradeoffs.** zstd-22 is slower to compress (seconds, not a real concern for a one-time export). It requires the `zstandard` Python package. Decompression is fast. Interestingly, lzma (which typically beats zlib on general data) compresses worse than zlib on int8 weight data, likely because the weight distributions do not suit its dictionary-based approach.
+**How it works.**
+1. After training, the model generates 64 sequences of 2048 tokens using temperature sampling
+2. Forward hooks collect H = X^T X (input correlations) for each linear layer
+3. The Hessian is damped: H += 0.01 * diag(H).mean() * I
+4. GPTQ quantizes column-by-column, using the Hessian to compensate: after quantizing column j, the error is distributed to remaining columns proportional to their correlation with column j via Cholesky decomposition
 
-**Who used it.** All entries from MLP3x+QAT (1.1502) onward use zstd-22. Earlier entries used zlib-9.
+```python
+# Simplified GPTQ core loop
+for j in range(cols):
+    q_j = round_and_clip(W[:, j], scale)
+    err = (W[:, j] - dequant(q_j)) / H_inv[j, j]
+    W[:, j+1:] -= err.outer(H_inv[j, j+1:])  # distribute error
+```
+
+**Impact.** The GPTQ-lite to Full Hessian GPTQ upgrade is the single biggest change in the new SOTA (1.1147), contributing roughly -0.003 to -0.005 BPB. The AR self-gen approach is what makes it legal.
+
+**Tradeoffs.** Adds ~30-60s to the export step for Hessian collection and GPTQ solve. Requires generating calibration sequences (a few seconds). Code complexity is significant. The Hessian matrices are collected on CPU to avoid GPU memory pressure.
+
+**Who used it.** Current SOTA (1.1147, abaybektursun, PR #1019). First introduced with training-data calibration in PRs #535/#569/#593/#609, made legal via AR self-gen in this entry.
+
+### Selective ±1 Pruning
+
+**What it is.** After int6 quantization, some quantized values are ±1 (one step away from zero). Selective pruning sets these to 0 if the reconstruction error improves. This creates more zeros in the weight matrix, which compresses better with LZMA/zstd.
+
+**Why it helps.** Weights at ±1 have small magnitude -- they contribute little to the output but cost entropy in compression. Setting them to zero when it reduces reconstruction error gives a dual benefit: slightly better model quality AND smaller compressed artifact.
+
+**Tradeoffs.** Minimal. It's a post-training optimization that takes seconds. The pruning is conservative (only prunes when it reduces error), so quality never decreases.
+
+**Who used it.** Current SOTA (1.1147), inherited from PR #609 by @saml212.
+
+### Compression: zstd-22 vs zlib vs LZMA
+
+**What it is.** After quantization, the weight tensors are serialized and compressed with a lossless compression algorithm. Three options have been explored: zlib (Python built-in, level 9), zstandard (zstd, level 22), and LZMA (preset 9).
+
+**Why it helps.** Better compression means more parameters fit in the 16MB budget. For a model on the edge of the size limit, the compression choice can determine whether an extra layer fits.
+
+**Compression comparison on int6 quantized weights:**
+| Algorithm | Relative Size | Speed | Package |
+|-----------|--------------|-------|---------|
+| zlib-9 | Baseline | Fast | Built-in |
+| zstd-22 | ~5% smaller | Medium | `zstandard` |
+| LZMA-9 | ~8-10% smaller | Slow | Built-in (`lzma`) |
+
+Note: earlier analysis suggested LZMA was worse on int8 data, but the current SOTA (1.1147) uses LZMA-9 on int6 data and achieves better compression than zstd-22. The effectiveness depends on the quantization format and weight distribution.
+
+**Who used it.** Entries from MLP3x+QAT (1.1502) through signalrush (1.1228) used zstd-22. The current SOTA (1.1147) switched to LZMA-9. The ternary/binary entries also use LZMA.
 
 ---
 
@@ -289,15 +341,17 @@ def _xsa_efficient(self, y, v):
 
 **Tradeoffs.** Adds ~2ms per step with the efficient implementation (down from ~7ms with naive repeat_interleave). Zero new parameters. The improvement is ~0.002 BPB when applied to the deepest layers.
 
-**Who used it.** Introduced in the Efficient Partial XSA entry (1.1307, unnir) on last 3 layers. Extended to last 4 layers in the XSA4+EMA entry (1.1271, jfprincz) and all subsequent records.
+**Who used it.** Introduced in the Efficient Partial XSA entry (1.1307, unnir) on last 3 layers. Extended to last 4 layers in the XSA4+EMA entry (1.1271, jfprincz). **The current SOTA (1.1147) applies XSA to ALL 11 layers** (`XSA_LAST_N=11`), after @gowtham0992 (PR #478) showed this forces cross-position information mixing from layer 0 at zero parameter cost.
 
 ### Partial XSA
 
-**What it is.** Rather than applying XSA to every layer, it is only applied to the deepest N layers (typically the last 3 or 4 out of 11). This targets the layers with the highest self-attention bias while minimizing compute overhead on the shallower layers where the bias is lower.
+**What it is.** Rather than applying XSA to every layer, it is only applied to the deepest N layers. Early entries used last 3-4 layers.
 
-**Why it helps.** The self-attention bias (cosine similarity between attention output and self-value) increases with layer depth. Applying XSA only where the bias is highest gives most of the benefit at a fraction of the compute cost. Empirically, XSA on the last 4 layers matches or exceeds XSA on all layers.
+**UPDATE (2026-03-25):** The current SOTA (1.1147) uses **XSA on ALL 11 layers** (`XSA_LAST_N=11`). The previous assumption that shallow layers have lower self-attention bias and don't benefit from XSA was overturned. XSA-all is now the standard.
 
-**Who used it.** Efficient Partial XSA entry (layers 8-10, last 3 of 11). All subsequent entries use `XSA_LAST_N=4` (layers 7-10).
+**Note on looped architectures:** The depth recurrence paper (PR #363) found that XSA-all was slightly harmful on looped models (+0.001 worse), because "all layers" in a looped model means only 3 unique computations repeated 3 times, unlike 11 unique computations in a flat model.
+
+**Who used it.** Evolution: last 3 (1.1307) -> last 4 (1.1271) -> all 11 (1.1147, current SOTA).
 
 ### Partial RoPE
 
@@ -483,6 +537,26 @@ def forward(self, x):
 
 **Who used it.** All entries from the Mixed Quant entry (1.1630) onward use `MLP_MULT=3`.
 
+### LeakyReLU(0.5)^2 Activation
+
+**What it is.** A drop-in replacement for the standard `relu(x)^2` activation in the MLP. Instead of zeroing negative inputs, LeakyReLU allows a fraction through:
+
+```python
+# Standard: dead gradient for x < 0
+x = torch.relu(self.fc(x)).square()
+
+# LeakyReLU(0.5)^2: preserves negative gradient flow
+x = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
+```
+
+With `negative_slope=0.5`, negative inputs are multiplied by 0.5 instead of being zeroed. After squaring, the output is always positive but the gradient flows through both positive and negative inputs.
+
+**Why it helps.** In standard ReLU^2, neurons that receive negative pre-activation are "dead" -- they contribute nothing to the output and receive no gradient signal. With a 3x MLP (hidden=1536), a significant fraction of neurons can be dead at any given time. LeakyReLU preserves gradient flow through all neurons, leading to more effective use of the MLP capacity. The improvement is roughly **-0.003 BPB**.
+
+**Tradeoffs.** Essentially free -- negligible compute overhead. One line of code change. The negative slope of 0.5 was found empirically; the depth recurrence paper (PR #363) notes this improvement is more reliable on 8xH100 with 80 data shards than on smaller setups.
+
+**Who used it.** First introduced by @parinzee (PR #493). Used by the LeakyReLU+TTT SOTA (1.1194) and current SOTA (1.1147).
+
 ### Layer Count Tradeoffs
 
 **What it is.** The number of transformer layers in the model. The baseline uses 9 layers. Top entries use 10 or 11.
@@ -592,6 +666,18 @@ for _ in range(5):
 
 **Who used it.** All entries use Muon for matrix parameters. It is the default optimizer in the challenge codebase.
 
+### Parallel Muon + Parameter Banking
+
+**What it is.** An enhanced version of Muon introduced by abaybektursun (PR #399). Two key ideas:
+
+1. **Parallel Muon**: Instead of sequential Newton-Schulz orthogonalization across parameters, all weight matrices are orthogonalized in parallel using batched operations. This reduces per-step overhead.
+
+2. **Parameter Banking**: During training, a "bank" of recent parameter checkpoints is maintained. The optimizer can interpolate between the current parameters and the bank to stabilize training and improve convergence.
+
+**Why it helps.** Parallel execution reduces the serial bottleneck of Newton-Schulz iterations. Parameter banking acts as a form of implicit regularization, preventing the model from straying too far from recent good solutions. Together they enable faster, more stable training.
+
+**Who used it.** All entries from the LeakyReLU+TTT entry (1.1194) onward, including the current SOTA (1.1147).
+
 ### Muon Momentum Warmup
 
 **What it is.** The Muon momentum coefficient starts at a lower value (0.92) and linearly increases to the target value (0.99) over the first 1500 steps:
@@ -669,7 +755,7 @@ def lr_mul(step, elapsed_ms):
 
 The Warmdown-Quantization entry discovered that `WARMDOWN_ITERS=20000` (far beyond actual steps) reduced the int8 quantization penalty from 0.014 BPB to 0.005 BPB, because the always-decaying LR produces dramatically tighter weight distributions with fewer outliers.
 
-**Who used it.** All entries tune warmdown. 3000 iterations is the standard for top entries, with the SOTA using 3500.
+**Who used it.** All entries tune warmdown. The current SOTA (1.1147) uses `WARMDOWN_ITERS=4000`.
 
 ---
 
@@ -695,7 +781,36 @@ Every token in the validation set is scored exactly once, but each scored token 
 
 **Implementation detail:** The `forward_logits` method is compiled with `torch.compile` for efficient batch inference during sliding window eval.
 
-**Who used it.** Introduced in the Sliding Window Eval entry (1.1925, Matthew Li). Used in all subsequent entries with `EVAL_STRIDE=64`.
+**Who used it.** Introduced in the Sliding Window Eval entry (1.1925, Matthew Li). Used in all subsequent entries. Originally with `EVAL_STRIDE=64`, now `EVAL_STRIDE=16` in top entries.
+
+### Stride-16 vs Stride-64
+
+**What it is.** The sliding window stride determines how many tokens are uniquely scored per window. Stride-64 scores 64 new tokens per window (each with 1984 context). Stride-16 scores only 16 new tokens per window (each with 2032 context).
+
+**Why stride-16 is better.** Each scored token gets 48 more tokens of context (2032 vs 1984). This small increase compounds across the entire validation set for roughly **-0.015 BPB** improvement. The tradeoff is 4x more windows to evaluate, meaning 4x longer eval time.
+
+**Timing.** On 8xH100, stride-16 evaluation takes ~4-6 minutes (vs ~1-2 minutes for stride-64). Still well within the 10-minute eval budget, especially if you're not using TTT.
+
+**Who used it.** The ternary/binary entries (FIIZiK_) pioneered stride-16. The depth recurrence paper (PR #363) confirmed -0.015 BPB gain. All competitive entries now use stride-16.
+
+### Temperature Scaling
+
+**What it is.** Before computing the evaluation loss, logits are divided by a temperature parameter T. Lower temperature (T<1) sharpens the probability distribution; higher temperature (T>1) softens it.
+
+```python
+# In eval:
+logits = model.forward_logits(x)
+logits = logits / temperature  # temperature scaling
+loss = F.cross_entropy(logits, targets)
+```
+
+**How to find the optimal temperature.** Run a grid search over [0.90, 0.95, 1.00, 1.05, 1.10] using a fast eval (stride=64), then apply the best temperature to the final stride-16 eval.
+
+**Why it helps.** Models trained with aggressive optimization (Muon, high momentum) can produce slightly overconfident or underconfident logits. Temperature scaling corrects the calibration at zero parameter cost. The optimal T is typically around 0.90-0.95 for models using relu^2 activations (the squared activation produces sharper distributions). SwiGLU models tend to prefer T=1.0.
+
+**Impact.** Roughly -0.001 to -0.003 BPB depending on the model. Free at eval time.
+
+**Who used it.** The ternary/binary entries (FIIZiK_) introduced temperature search. The depth recurrence paper (PR #363) confirmed T=0.90 is optimal for relu^2 and that it's activation-dependent.
 
 ### Sequence Length and Eval
 
@@ -737,30 +852,88 @@ Notably, most of the improvement came from document isolation and strided evalua
 
 **Tradeoffs.** TTT adds significant eval-time compute. The LoRA approach enables batched evaluation (64 documents in parallel), making it ~5x faster than full fine-tuning. Uses ~1/10 of the evaluation budget. The technique was not combined with other improvements (it uses the naive baseline model), so there is potential for stacking.
 
-**Who used it.** The LoRA TTT entry (1.1928, samacqua). No subsequent entries have combined TTT with the improved training techniques, suggesting this is an underexplored direction.
+**Who used it.** The LoRA TTT entry (1.1928, samacqua). Largely superseded by Full-Model SGD TTT.
+
+### Full-Model SGD TTT (Score-First)
+
+**What it is.** Instead of training small LoRA adapters, this approach trains the full model weights using SGD with momentum. The key innovation is the "score-first" protocol that ensures legality: for each 32K-token chunk of the validation set, first score all tokens in the chunk (under `inference_mode()`), then train the model on that chunk. Every token is scored BEFORE any update that could use it.
+
+**How it works:**
+1. Divide validation tokens into 32K-token chunks
+2. For each chunk:
+   - **Phase 1 (Score):** Sliding window eval on this chunk's tokens (inference_mode, no gradients)
+   - **Phase 2 (Train):** SGD on this chunk's tokens (gradient enabled), with cosine LR decay across chunks
+3. The model progressively adapts to the validation data distribution
+
+**Hyperparameters (from PR #549):**
+- Optimizer: SGD(lr=0.002, momentum=0.9)
+- 3 epochs per chunk
+- Cosine LR decay across chunks
+- Freeze first 2 blocks for stability
+- Gradient clipping at 1.0
+
+**Impact.** On the LeakyReLU+Parallel Muon stack (PR #549): **-0.0025 BPB** improvement. Combined with other changes for a total of 1.1194 BPB.
+
+**IMPORTANT UPDATE (2026-03-25):** The current SOTA author (abaybektursun) **dropped TTT** after 25 failed attempts on the newer Full Hessian GPTQ stack. TTT was neutral or slightly negative when combined with better quantization. The hypothesis is that Full GPTQ already captures much of the distributional information that TTT exploits, making the two techniques redundant.
+
+**Who used it.** PR #549 (1.1194, abaybektursun). Dropped in PR #1019 (1.1147) due to negative interactions with Full GPTQ.
+
+---
+
+## Confirmed Dead Ends
+
+### Depth Recurrence
+
+**What it is.** Reusing the same transformer blocks multiple times in a forward pass (weight sharing across loop iterations). The idea is to get more effective depth per byte of artifact. For example, a "3x3" config: 3 stem blocks + 3 core blocks repeated 3 times + 3 tail blocks = 12 effective layers from 9 unique blocks.
+
+**Why it was promising.** In a 16MB-capped competition, sharing weights across loop iterations should give more effective depth per parameter. Samsung's TRM, Alibaba's Huginn, and Relaxed Recursive Transformers all suggested potential.
+
+**Why it failed (conclusively).** Three independent researchers arrived at the same conclusion:
+
+| Researcher | Best Flat | Best Looped | Gap |
+|-----------|-----------|-------------|-----|
+| evangelinehelsinki (PR #363) | 1.1648 | 1.1787 | +0.014 |
+| Controlled comparison (same config) | 1.1648 | 1.1894 | +0.025 |
+| Frosty40 (PR #499) | - | - | "recursion is a bust" |
+| FIIZiK_ (250+ experiments) | - | - | "pure noise" across 5 repeat counts |
+
+**The two taxes of recurrence:**
+1. **Quantization compounding:** Shared weights are quantized once but errors propagate through every repeat. For 3 repeats, error is seen 3x. For 5 repeats, 5x. Errors compound nonlinearly.
+2. **Step time overhead:** Each loop adds wall-clock time. Looped 3x3 = 144ms/step vs flat 11L = 112ms/step. That's 22% fewer training steps in 10 minutes (4175 vs 5375 steps).
+
+**One useful finding: Noisy QAT.** For looped architectures, inject uniform noise calibrated to quantization step size during training (only on shared blocks). This collapsed the quantization gap from 0.37 BPB to 0.002 BPB. The technique doesn't help flat architectures but is novel for any depth-recurrent system.
+
+**Verdict:** Do not pursue depth recurrence for Parameter Golf. The gap is structural, not a tuning problem.
 
 ---
 
 ## Summary: Technique Impact Table
 
-A rough ordering of techniques by their contribution to the final score, based on ablation data from various entries:
+A rough ordering of techniques by their contribution to the final score, based on ablation data from various entries (updated 2026-03-30):
 
-| Technique | Approximate Impact | Type |
-|-----------|-------------------|------|
-| Sliding window eval (stride=64) | -0.032 to -0.034 BPB | Eval |
-| MLP 3x expansion (with int6) | -0.025 to -0.030 BPB | Architecture |
-| 11 layers (from 9, with int6+zstd) | -0.015 to -0.020 BPB | Architecture |
-| QAT STE (eliminate quant gap) | -0.010 to -0.016 BPB | Quantization |
-| FP16 embeddings | -0.006 to -0.010 BPB | Quantization |
-| EMA weight averaging | -0.005 to -0.006 BPB | Training |
-| Weight decay 0.04 | -0.003 to -0.005 BPB | Training |
-| SmearGate + BigramHash | -0.003 to -0.005 BPB | Embeddings |
-| XSA on last 4 layers | -0.002 to -0.003 BPB | Attention |
-| Partial RoPE (16/64) | -0.002 BPB | Attention |
-| Orthogonal initialization | -0.001 to -0.003 BPB | Architecture |
-| LN Scale factors | -0.001 BPB | Architecture |
-| GPTQ-lite clip search | -0.0006 BPB | Quantization |
-| zstd-22 (vs zlib) | Enables larger model | Compression |
-| Warmdown tuning (3000-3500) | -0.001 to -0.002 BPB | Training |
+| Technique | Approximate Impact | Type | Status |
+|-----------|-------------------|------|--------|
+| Sliding window eval (stride=64) | -0.032 to -0.034 BPB | Eval | Standard |
+| MLP 3x expansion (with int6) | -0.025 to -0.030 BPB | Architecture | Standard |
+| 11 layers (from 9, with int6+zstd) | -0.015 to -0.020 BPB | Architecture | Standard |
+| Stride-16 eval (vs stride-64) | ~-0.015 BPB | Eval | New standard |
+| QAT STE (eliminate quant gap) | -0.010 to -0.016 BPB | Quantization | Standard |
+| FP16 embeddings | -0.006 to -0.010 BPB | Quantization | Standard |
+| EMA weight averaging | -0.005 to -0.006 BPB | Training | Standard |
+| Full Hessian GPTQ (vs GPTQ-lite) | -0.003 to -0.005 BPB | Quantization | **New SOTA** |
+| Weight decay 0.04 | -0.003 to -0.005 BPB | Training | Standard |
+| SmearGate + BigramHash | -0.003 to -0.005 BPB | Embeddings | Standard |
+| LeakyReLU(0.5)^2 (vs relu^2) | ~-0.003 BPB | Architecture | New standard |
+| XSA on all 11 layers | -0.002 to -0.003 BPB | Attention | **New SOTA** |
+| Full-model SGD TTT | -0.0025 BPB | Eval | **Dead on new stack** |
+| Partial RoPE (16/64) | -0.002 BPB | Attention | Standard |
+| Temperature scaling (T=0.90) | -0.001 to -0.003 BPB | Eval | New standard |
+| Orthogonal initialization | -0.001 to -0.003 BPB | Architecture | Standard |
+| LZMA-9 (vs zstd-22) | Enables larger model | Compression | **New SOTA** |
+| Warmdown 4000 | -0.001 to -0.002 BPB | Training | **New SOTA** |
+| LN Scale factors | -0.001 BPB | Architecture | Standard |
+| Selective ±1 pruning | Enables smaller artifact | Quantization | **New SOTA** |
+| GPTQ-lite clip search | -0.0006 BPB | Quantization | Superseded |
+| Depth recurrence | +0.025 BPB WORSE | Architecture | **Dead** |
 
-Note: impacts are approximate and context-dependent. Many techniques interact (e.g., int6 enables MLP 3x; weight decay improves quantization quality).
+Note: impacts are approximate and context-dependent. Many techniques interact (e.g., int6 enables MLP 3x; Full GPTQ makes TTT redundant).

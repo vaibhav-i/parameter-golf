@@ -5,7 +5,7 @@
 OpenAI's **Model Craft Challenge: Parameter Golf** — compete to train the best language model that fits in a **16MB artifact** and trains in **under 10 minutes on 8xH100s**, evaluated by bits-per-byte compression on the FineWeb validation set.
 
 Contest runs: March 18 – April 30, 2026.
-Current SOTA: **1.1228 bpb** (signalrush, 2026-03-22).
+Current SOTA: **1.1147 bpb** (abaybektursun, 2026-03-25).
 
 ---
 
@@ -142,17 +142,17 @@ Expected baseline: ~1.2244 bpb, model under 16MB.
 
 Comprehensive research in `research/` — see `research/README.md` for full index.
 
-### SOTA Stack (1.1228 bpb)
-11 layers, 512 dim, 4 KV heads (GQA), MLP 3x expansion, int6 QAT (STE), GPTQ-lite clip search, EMA, FP16 embeddings, tied embeddings, Partial RoPE (16/64 dims), XSA on last 4 layers, sliding window eval (stride 64), Muon optimizer (WD=0.04), zstd-22 compression, warmdown at step 3500.
+### SOTA Stack (1.1147 bpb — 2026-03-25, abaybektursun)
+11 layers, 512 dim, 8 GQA heads / 4 KV heads, MLP 3x with LeakyReLU(0.5)^2, Full Hessian GPTQ int6 with AR self-gen calibration (model generates own calib data, no external data during quant), XSA on ALL 11 layers, BigramHash 3072×112, Partial RoPE (16/64 dims), LN Scale, VE128 layers 9-10, SmearGate, U-Net skips, EMA(0.997) + Tight SWA(every 50), Parallel Muon + Parameter Banking, warmdown 4000, LZMA preset=9 compression, selective ±1 pruning, sliding eval stride=16, temperature scaling. **No TTT** (dropped after 25 failed attempts).
 
-### Top Untried Opportunities (ranked by expected value)
-1. **BigramHash 10240 buckets** in SOTA — config change, ~0.001-0.003 BPB
-2. **Warmdown sweep** beyond 3500 — hyperparameter tuning, ~0.001-0.002 BPB
-3. **QK-Norm ablation** — already in SOTA code (lines 521-522), test removing/tuning q_gain_init
-4. **Multi-token prediction** — auxiliary heads discarded at inference (zero size cost), ~0.003-0.008 BPB
-5. **LoRA TTT on SOTA base** — only tested on baseline (got 1.1928), huge room on modern base, ~0.005-0.015 BPB
-6. **Depth recurrence** (Cycle(rev) weight sharing) — 12 effective layers at 6-layer cost, ~0.005-0.015 BPB
-7. **Simplified hyperconnections** — generalizes U-Net skip pattern, ~0.002-0.004 BPB
+### Top Opportunities (ranked by expected value, updated 2026-03-30)
+1. **Multi-token prediction** — auxiliary heads discarded at inference (zero artifact cost), ~0.003-0.008 BPB
+2. **Port Full Hessian GPTQ + AR self-gen calibration** to our experiments — biggest single technique gain
+3. **LZMA compression** — replace zstd, better compression ratio
+4. **Int5 MLP + 12th layer** — save bytes via int5 on MLP, fund an extra layer
+5. **QK-Norm ablation** — test removing/tuning q_gain_init
+6. ~~Depth recurrence~~ — **CONFIRMED DEAD** (+0.025 BPB worse, PR #363)
+7. ~~TTT~~ — **NEUTRAL/NEGATIVE** on current stack (25 failed attempts by SOTA author)
 
 ### Key Research Files
 - `research/strategy.md` — actionable playbook with technique rankings + next steps
@@ -167,42 +167,43 @@ Comprehensive research in `research/` — see `research/README.md` for full inde
 - `research/lora-ttt-port-guide.md` — LoRA TTT porting to SOTA: code diffs, timing estimates, optimization strategies
 
 ### SOTA Code Quick Reference
-- `bigram_vocab_size`: line 77, env `BIGRAM_VOCAB_SIZE` (default 2048)
-- `warmdown_iters`: line 38, env `WARMDOWN_ITERS` (default 3500)
-- `rope_dims`: line 80, env `ROPE_DIMS` (default 16)
-- `qk_gain_init`: line 44 (default 1.5)
-- `ln_scale`: line 81, env `LN_SCALE` (default 1, set 0 to disable)
-- Artifact headroom: ~444 KB free (15.55 MB used of 16 MB)
+### New SOTA (2026-03-25) Quick Reference
+- Script: `records/track_10min_16mb/2026-03-25_ValCalib_GPTQ_XSA_BigramHash3072/train_gpt.py`
+- Run: `BIGRAM_VOCAB_SIZE=3072 BIGRAM_DIM=112 WARMDOWN_ITERS=4000 TARGET_MB=15.9 SEED=314 torchrun --standalone --nproc_per_node=8 train_gpt.py`
+- Key: `xsa_last_n=11`, `bigram_vocab_size=3072`, `bigram_dim=112`, `warmdown_iters=4000`
+- Compression: LZMA preset=9 (not zstd)
+- GPTQ: Full Hessian with AR self-generated calibration data
+- Artifact: ~15.91 MB (tight — ~90KB headroom)
 
 ---
 
-## Experiment Variants (March 25, 2026)
+## Experiment Variants (updated 2026-03-30)
 
 Ready-to-run experiment code in `experiments/`. Use `bash experiments/run_sweep.sh` for the full menu.
 
-### Env-var-only experiments (use baseline script)
+**IMPORTANT**: Our experiment baseline is the 2026-03-22 signalrush code. The new SOTA (2026-03-25) adds Full GPTQ + AR self-gen + XSA-all + BigramHash 3072 + LZMA. We should rebase on the new SOTA code for maximum competitiveness.
+
+### Quick wins on NEW SOTA (env vars only, use new SOTA script)
 | Experiment | Command | Expected Gain |
 |---|---|---|
-| v1: MTP 2 heads | `MTP_NUM_HEADS=2 MTP_LOSS_WEIGHT=0.2` | -0.003 to -0.005 |
-| v3: NTK eval 2816 | `EVAL_SEQ_LEN=2816` | -0.001 to -0.003 |
-| v5: MTP + BigramHash | `MTP_NUM_HEADS=2 MTP_LOSS_WEIGHT=0.2 BIGRAM_VOCAB_SIZE=4096` | -0.004 to -0.006 |
-| v7: NTK + Bigram + WD | `EVAL_SEQ_LEN=2816 BIGRAM_VOCAB_SIZE=4096 WARMDOWN_ITERS=4500` | -0.003 to -0.005 |
+| MTP 2 heads | `MTP_NUM_HEADS=2 MTP_LOSS_WEIGHT=0.2` | -0.003 to -0.005 |
+| XSA-all (already default in new SOTA) | `XSA_LAST_N=11` | already included |
+| BigramHash 3072 (already default in new SOTA) | `BIGRAM_VOCAB_SIZE=3072 BIGRAM_DIM=112` | already included |
+| Warmdown 4000 (already default in new SOTA) | `WARMDOWN_ITERS=4000` | already included |
 
-### Code-change experiments (modified train_gpt.py)
+### Code-change experiments (modified train_gpt.py, based on old baseline)
 | Experiment | Script | Key Change |
 |---|---|---|
-| v2: Int5 MLP | `experiments/v2_int5_mlp/train_gpt.py` | int5 quant for MLP, int6 for attention |
-| v4: 12L + Int5 | `experiments/v4_12layers_int5/train_gpt.py` | 12 layers + int5 MLP |
-| v8: Kitchen Sink | Uses v4 script + env vars | All improvements stacked |
-| v9: LoRA TTT | `experiments/v9_lora_ttt/train_gpt.py` | Test-time LoRA adaptation |
+| v2: Int5 MLP | `experiments/v2_int5_mlp/train_gpt.py` | int5 quant for MLP + LeakyReLU + stride-16 + temp scaling |
+| v4: 12L + Int5 | `experiments/v4_12layers_int5/train_gpt.py` | 12 layers + int5 MLP + LeakyReLU + stride-16 + temp scaling |
+| v9: Full-model TTT | `experiments/v9_lora_ttt/train_gpt.py` | SGD TTT (likely dead — neutral on SOTA stack) |
 
-### Experiment Priorities (run in this order)
-1. **v1_mtp2** — free gain, zero risk
-2. **v3_ntk_2816** — free gain from longer eval context
-3. **v2_int5_mlp** — validate int5 quality
-4. **v5_mtp2_bigram4096** — stack free wins
-5. **v4_12layers_int5** — if int5 works, add 12th layer
-6. **v9_lora_ttt** — highest EV but most complex
+### Experiment Priorities (updated 2026-03-30)
+1. **Rebase on new SOTA** (2026-03-25 code) — get Full GPTQ + AR self-gen + LZMA for free
+2. **MTP 2 heads on new SOTA** — free gain, zero artifact cost
+3. **Int5 MLP on new SOTA** — validate int5 quality, potentially fund 12th layer
+4. **12 layers + int5 on new SOTA** — if int5 works, biggest architectural gain
+5. ~~v9 TTT~~ — **deprioritized** (SOTA author found TTT neutral/negative after 25 attempts)
 
 ---
 
