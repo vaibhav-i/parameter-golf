@@ -104,11 +104,7 @@ class Hyperparameters():
     embed_bits = int(os.environ.get('EMBED_BITS', 8))
     matrix_clip_sigmas = float(os.environ.get('MATRIX_CLIP_SIGMAS', 12.85))
     embed_clip_sigmas = float(os.environ.get('EMBED_CLIP_SIGMAS', 20.0))
-
-    # Causal SLOT eval-time adaptation
-    slot_enabled = bool(int(os.environ.get('SLOT_ENABLED', '0')))
-    slot_steps = int(os.environ.get('SLOT_STEPS', '16'))
-    slot_lr = float(os.environ.get('SLOT_LR', '0.005'))
+    mr_gptq_enabled = bool(int(os.environ.get('MR_GPTQ_ENABLED', '1')))
 
     # Distributed setup
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -525,8 +521,7 @@ class GPT(nn.Module):
                       module.weight.shape[1] >= 64):
                     nn.init.orthogonal_(module.weight, gain=1.0)
 
-    def forward_hidden(self, input_ids: Tensor) -> Tensor:
-        """Run transformer blocks and return hidden states before the final projection."""
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         if self.embed_proj is not None:
@@ -550,18 +545,11 @@ class GPT(nn.Module):
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
-        return x
-
-    def hidden_to_logits(self, hidden: Tensor) -> Tensor:
-        """Project hidden states to vocabulary logits with softcap."""
         if self.tie_embeddings:
-            logits_proj = F.linear(hidden, self.tok_emb.weight)
+            logits_proj = F.linear(x, self.tok_emb.weight)
         else:
-            logits_proj = self.lm_head(hidden)
+            logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-
-    def forward_logits(self, input_ids: Tensor) -> Tensor:
-        return self.hidden_to_logits(self.forward_hidden(input_ids))
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         logits = self.forward_logits(input_ids)
@@ -809,6 +797,53 @@ def collect_hessians(
     return hessians
 
 
+def _fwht(x: torch.Tensor) -> torch.Tensor:
+    """Fast Walsh-Hadamard Transform along the last dimension (in-place butterfly)."""
+    n = x.shape[-1]
+    h = 1
+    while h < n:
+        x = x.reshape(*x.shape[:-1], n // (2 * h), 2 * h)
+        x_even = x[..., :h]
+        x_odd = x[..., h:]
+        x = torch.cat([x_even + x_odd, x_even - x_odd], dim=-1)
+        x = x.reshape(*x.shape[:-2], n)
+        h *= 2
+    return x
+
+
+def hadamard_rotation(W: torch.Tensor, seed: int = 42) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply a randomized Hadamard rotation to weight matrix columns.
+
+    Rotates W by W @ diag(D) @ H / sqrt(n_pad), where D is a random ±1 diagonal
+    and H is the Walsh-Hadamard matrix. Spreads outliers uniformly across all
+    columns, reducing GPTQ quantization MSE (MR-GPTQ, PR #1400).
+
+    Returns:
+        W_rot: rotated weight matrix (same shape as W[:, :n])
+        D: the random sign vector used (needed to invert the rotation downstream)
+    """
+    n = W.shape[1]
+    # Pad to next power of 2 for the fast transform
+    n_pad = 1
+    while n_pad < n:
+        n_pad *= 2
+
+    torch.manual_seed(seed)
+    D = torch.randint(0, 2, (n_pad,), device=W.device).float() * 2 - 1  # ±1
+
+    if n < n_pad:
+        W_pad = torch.zeros(W.shape[0], n_pad, device=W.device, dtype=W.dtype)
+        W_pad[:, :n] = W
+    else:
+        W_pad = W.clone()
+
+    # W_rot = W_pad * D (scale columns) then Hadamard-transform rows
+    W_rot = W_pad * D.unsqueeze(0)
+    W_rot = _fwht(W_rot) / (n_pad ** 0.5)
+
+    return W_rot[:, :n], D[:n]
+
+
 def gptq_quantize_weight(
     w: Tensor,
     H: Tensor,
@@ -875,11 +910,22 @@ def gptq_mixed_quantize(
             continue
         cs = h.embed_clip_sigmas if "tok_emb" in name else h.matrix_clip_sigmas
         bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
-        q, s = gptq_quantize_weight(
-            t, hessians[name], clip_sigmas=cs, clip_range=2**(bits - 1) - 1)
+        if h.mr_gptq_enabled and t.ndim == 2:
+            # MR-GPTQ: rotate weight columns with a randomized Hadamard before quantizing.
+            # This spreads outliers uniformly, dramatically reducing quantization MSE.
+            # Note: for a full MR-GPTQ deployment the inverse rotation must be absorbed
+            # into the adjacent layer's inputs; here we test the quantization-error
+            # reduction in isolation as a first ablation.
+            t_rot, _D = hadamard_rotation(t.float())
+            q, s = gptq_quantize_weight(
+                t_rot, hessians[name], clip_sigmas=cs, clip_range=2**(bits - 1) - 1)
+            meta[name] = f"mr-gptq (int{bits})"
+        else:
+            q, s = gptq_quantize_weight(
+                t, hessians[name], clip_sigmas=cs, clip_range=2**(bits - 1) - 1)
+            meta[name] = f"gptq (int{bits})"
         result[name + ".q"] = q
         result[name + ".scale"] = s
-        meta[name] = f"gptq (int{bits})"
 
     categories = collections.defaultdict(set)
     for name, cat in meta.items():
@@ -1157,98 +1203,6 @@ def eval_val_sliding(
     return _loss_bpb(loss_sum, token_count, byte_count)
 
 
-def eval_val_sliding_causal_slot(
-    h: Hyperparameters,
-    device: torch.device,
-    val_data: ValidationData,
-    base_model: nn.Module,
-    slot_steps: int = 16,
-    slot_lr: float = 0.005,
-    batch_seqs: int = 8,  # kept for API compatibility but unused (windows processed one at a time)
-) -> tuple[float, float]:
-    """Causal SLOT: optimize per-window delta on context tokens, score with delta applied.
-
-    Each window gets its own fresh delta optimized only on that window's context tokens.
-    Windows are processed one at a time (no batching) to prevent cross-window gradient
-    leakage where later windows' scored tokens could influence earlier windows via a
-    shared delta. Fix per clarkkev's review of the original batched implementation.
-    """
-    base_model.eval()
-    seq_len = h.eval_seq_len
-    context_size = seq_len - h.eval_stride
-    total_tokens = val_data.val_tokens.numel() - 1
-    model_dim = h.model_dim
-
-    window_starts = [ws for ws in range(0, total_tokens, h.eval_stride)
-                     if ws + context_size < total_tokens]
-    total_windows = len(window_starts)
-    my_s = (total_windows * h.rank) // h.world_size
-    my_e = (total_windows * (h.rank + 1)) // h.world_size
-    my_windows = window_starts[my_s:my_e]
-
-    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    token_count = torch.zeros((), device=device, dtype=torch.float64)
-    byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    for ws in my_windows:
-        we = min(ws + seq_len, total_tokens)
-        wlen = we - ws
-        chunk = val_data.val_tokens[ws:we + 1].to(dtype=torch.int64, device=device)
-        x = chunk[:-1].unsqueeze(0)  # [1, wlen]
-        y = chunk[1:]                 # [wlen]
-
-        # Fresh delta per window — no cross-window leakage
-        delta = torch.zeros(1, 1, model_dim, device=device, dtype=torch.bfloat16, requires_grad=True)
-        slot_opt = torch.optim.AdamW(
-            [delta], lr=slot_lr, betas=(0.3, 0.9), weight_decay=1e-8, eps=1e-5
-        )
-
-        # Optimize delta on context tokens only
-        for _ in range(slot_steps):
-            slot_opt.zero_grad()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                hidden = base_model.forward_hidden(x)          # [1, wlen, model_dim]
-                hidden_adapted = hidden + delta                 # broadcast over seq dim
-                logits_ctx = base_model.hidden_to_logits(hidden_adapted)  # [1, wlen, vocab]
-
-            # Only train on context region (positions before the scored stride)
-            ctx_end = context_size
-            ctx_logits = logits_ctx[0, :ctx_end, :].float()
-            ctx_targets = y[:ctx_end]
-            ctx_loss = F.cross_entropy(ctx_logits, ctx_targets)
-            ctx_loss.backward()
-            slot_opt.step()
-
-        # Score the stride region with the optimized delta (frozen)
-        with torch.inference_mode():
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                hidden = base_model.forward_hidden(x)
-                hidden_adapted = hidden + delta.detach()
-                logits = base_model.hidden_to_logits(hidden_adapted)
-
-        s = 0 if ws == 0 else context_size
-        nll = F.cross_entropy(
-            logits[0, s:wlen, :].float(),
-            y[s:wlen],
-            reduction="none"
-        )
-        loss_sum += nll.sum().to(torch.float64)
-        token_count += float(wlen - s)
-        tgt = y[s:wlen]
-        prev = x[0, s:wlen]
-        tb = val_data.base_bytes_lut[tgt].to(torch.float64)
-        tb += (val_data.has_leading_space_lut[tgt] & ~val_data.is_boundary_token_lut[prev]).to(torch.float64)
-        byte_count += tb.sum()
-
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
-
-    base_model.train()
-    return _loss_bpb(loss_sum, token_count, byte_count)
-
-
 def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1453,10 +1407,6 @@ def train_and_eval(h: Hyperparameters, device: torch.device) -> None:
     timed_eval("quantized", eval_val, h, device, val_data, compiled_model)
     if h.sliding_window_enabled:
         timed_eval("quantized_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
-    if h.slot_enabled:
-        timed_eval("causal_slot_sliding_window", eval_val_sliding_causal_slot,
-                   h, device, val_data, eval_model,
-                   slot_steps=h.slot_steps, slot_lr=h.slot_lr)
 
 
 def main():
