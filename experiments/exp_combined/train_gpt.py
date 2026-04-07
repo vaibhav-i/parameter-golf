@@ -1368,6 +1368,16 @@ def eval_val_sliding_causal_slot_with_log_bias(
     after each scored token.
     """
     base_model.eval()
+    # The prior eval pass may have run under torch.inference_mode(), tagging the
+    # model's buffers (e.g. RoPE cos/sin) as inference tensors. SLOT needs autograd
+    # to flow through the model, so we clone all buffers to strip the inference tag.
+    with torch.inference_mode(mode=False):
+        with torch.no_grad():
+            for module in base_model.modules():
+                for name, buf in list(module._buffers.items()):
+                    if buf is not None:
+                        module._buffers[name] = buf.clone()
+
     seq_len = h.eval_seq_len
     context_size = seq_len - h.eval_stride
     total_tokens = val_data.val_tokens.numel() - 1
