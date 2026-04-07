@@ -112,7 +112,7 @@ class Hyperparameters():
     log_bias_reset_per_window = bool(int(os.environ.get('LOG_BIAS_RESET', '0')))
 
     # Causal SLOT eval-time adaptation
-    slot_enabled = bool(int(os.environ.get('SLOT_ENABLED', '0')))
+    slot_enabled = bool(int(os.environ.get('SLOT_ENABLED', '1')))
     slot_steps = int(os.environ.get('SLOT_STEPS', '16'))
     slot_lr = float(os.environ.get('SLOT_LR', '0.005'))
 
@@ -1071,7 +1071,7 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * seq_len
@@ -1127,7 +1127,7 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    with torch.inference_mode():
+    with torch.no_grad():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
             bsz = len(batch_ws)
@@ -1322,7 +1322,7 @@ def eval_val_sliding_causal_slot(
             slot_opt.step()
 
         # Score the stride region with the optimized delta (frozen)
-        with torch.inference_mode():
+        with torch.no_grad():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 hidden = base_model.forward_hidden(x)
                 hidden_adapted = hidden + delta.detach()
