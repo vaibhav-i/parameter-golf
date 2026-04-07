@@ -112,7 +112,7 @@ class Hyperparameters():
     log_bias_reset_per_window = bool(int(os.environ.get('LOG_BIAS_RESET', '0')))
 
     # Causal SLOT eval-time adaptation
-    slot_enabled = bool(int(os.environ.get('SLOT_ENABLED', '1')))
+    slot_enabled = bool(int(os.environ.get('SLOT_ENABLED', '0')))
     slot_steps = int(os.environ.get('SLOT_STEPS', '16'))
     slot_lr = float(os.environ.get('SLOT_LR', '0.005'))
 
